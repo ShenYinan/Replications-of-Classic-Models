@@ -1,0 +1,285 @@
+---
+title: "mtry_randomforest"
+author: "SHEN, Yinan"
+date: "12/20/2020"
+output: html_document
+---
+
+Generate Function:
+```{r}
+library(MASS)
+library(randomForest)
+library(glmnet)
+# n: samples
+# p: features
+# s: valid features
+# rho: to generate Sigma[i,j] = rho^(abs(i-j))
+# Sigma: covariance of features, p*p
+# SNR: signal to noise ratio
+# nrep: times of replications
+Generate <- function(n, p, s, rho, SNR, nrep){
+  X <- matrix(0, nrow = n, ncol = p)
+  Beta <- matrix(0, nrow = p, ncol = 1)
+  Beta[1:s] <- 1
+  Sigma <- matrix(0, nrow = p, ncol = p)
+  for (i in 1:p) {
+    for (j in 1:p) {
+      Sigma[i, j] <- rho^(abs(i-j))
+    }
+  }
+  X <- mvrnorm(n = n, mu = rep(0, p), Sigma = Sigma)
+  sigmae <- t(Beta) %*% Sigma %*% Beta/SNR
+  noise <- matrix(0, nrow = n, ncol = nrep)
+  for (k in 1:n) {
+    noise[k, ] <- rnorm(nrep, mean = 0, sd = sqrt(sigmae))
+  }
+  f <- X%*%Beta
+  Data <- list(X = X, f = f, Beta = Beta, noise = noise, sigmae = sigmae)
+  return(Data)
+}
+```
+Function of computing degrees of freedom and test errors using Random Forest:
+```{r}
+Compute_rdmforest <- function(n, p, s, rho, SNR, nrep, maxnode, mtry_list){
+  m1 <- length(mtry_list)
+  dof_rdforest <- matrix(0, nrow = 1, ncol = m1)
+  train_rdforest <- matrix(0, nrow = 4, ncol = m1)
+  rownames(train_rdforest) <- c("MSE", "bias", "variance", "bias+variance")
+  
+  testerror_rdforest <- matrix(0, nrow = 1, ncol = m1)
+  test_rdforest <- matrix(0, nrow = 4, ncol = m1)
+  rownames(test_rdforest) <- c("MSE", "bias", "variance", "bias+variance")
+  
+  Data_train <- Generate(n, p, s, rho, SNR, nrep = nrep)
+  Data_test <- Generate(n, p, s, rho, SNR, nrep = nrep)
+  for (t in 1:m1) {
+    mtry <- floor(mtry_list[t] * p)
+    estimate_rdforest <- matrix(0, nrow = n, ncol = nrep)
+    estimate_test <- matrix(0, nrow = n, ncol = nrep)
+    for (i in 1:nrep) {
+      rdforest <- randomForest(x = Data_train$X, y = c(Data_train$f+Data_train$noise[,i]), mtry = mtry, maxnodes = maxnode)
+      
+      estimate_rdforest[,i] <- predict(rdforest, newdata = Data_train$X)
+      
+      estimate_test[,i] <- predict(object = rdforest, newdata = Data_test$X)
+    }
+    testerror_rdforest[t] <- testerror_rdforest[t]/nrep
+    temp00 <- matrix(rowMeans(estimate_rdforest), ncol = 1)
+    temp0 <- Data_train$f %*% matrix(1, nrow = 1, ncol = nrep)
+    temp1 <- temp0 + Data_train$noise
+    temp1 <- temp1 - matrix(rowMeans(temp1), ncol = 1) %*% matrix(1, nrow = 1, ncol = nrep)
+    temp2 <- estimate_rdforest - temp00 %*% matrix(1, nrow = 1, ncol = nrep)
+    dof_rdforest[t] <- sum(temp1*temp2)/(nrep * Data_train$sigmae)
+    train_rdforest[1,t] <- sum((temp0 + Data_train$noise - estimate_rdforest)^2)/(nrep * n)
+    train_rdforest[2,t] <- sum((temp00-Data_train$f)^2)/n
+    train_rdforest[3,t] <- sum((temp00 %*% matrix(1, nrow = 1, ncol = nrep) - estimate_rdforest)^2)/(nrep * n)
+    train_rdforest[4,t] <- train_rdforest[2,t] + train_rdforest[3,t]
+    
+    temptest00 <- matrix(rowMeans(estimate_test), ncol = 1)
+    temptest0 <- Data_test$f %*% matrix(1,nrow = 1, ncol = nrep)
+    temptest1 <- temptest0 + Data_test$noise
+    test_rdforest[1,t] <- sum((temptest1 - estimate_test)^2)/(nrep * n)
+    test_rdforest[2,t] <- sum((temptest00 - Data_test$f)^2)/n
+    test_rdforest[3,t] <- sum((temptest00 %*% matrix(1, nrow = 1, ncol = nrep) - estimate_test)^2)/(nrep * n)
+    test_rdforest[4,t] <- test_rdforest[2,t] + test_rdforest[3,t]
+  }
+  result <- list(train_rdforest = train_rdforest, dof_rdforest = dof_rdforest, test_rdforest=test_rdforest)
+  return(result)
+}
+```
+Function of computing degrees of freedom and test errors using ridge regression and lasso regression:
+```{r}
+Compute_ridge_lasso <- function(n, p, s, rho, SNR, nrep, lambda){
+  Data_train <- Generate(n, p, s, rho, SNR, nrep = nrep)
+  Data_test <- Generate(n, p, s, rho, SNR, nrep = nrep)
+  m2 <- length(lambda)
+  # ridge
+  dof_ridge <- matrix(0, nrow = 1, ncol = m2)
+  train_ridge <- matrix(0, nrow = 4, ncol = m2)
+  rownames(train_ridge) <- c("MSE", "bias", "variance", "bias+variance")
+  testerror_ridge <- matrix(0, nrow = 1, ncol = m2)
+  # lasso
+  dof_lasso <- matrix(0, nrow = 1, ncol = m2)
+  train_lasso <- matrix(0, nrow = 4, ncol = m2)
+  rownames(train_lasso) <- c("MSE", "bias", "variance", "bias+variance")
+  testerror_lasso <- matrix(0, nrow = 1, ncol = m2)
+  
+  for (t in 1:m2) {
+    estimate_ridge <- matrix(0, nrow = n, ncol = nrep)
+    estimate_lasso <- matrix(0, nrow = n, ncol = nrep)
+    
+    for (i in 1:nrep) {
+      beta_ridge <- glmnet(x = Data_train$X, y = c(Data_train$f+Data_train$noise[,i]), alpha = 0, lambda = lambda[t])
+      estimate_ridge[,i] <- predict(beta_ridge, Data_train$X)
+      test_ridge <- predict(beta_ridge, Data_test$X)
+      testerror_ridge[t] <- testerror_ridge[t] + mean((Data_test$f+Data_test$noise[,i]-test_ridge)^2)
+      
+      beta_lasso <- glmnet(x = Data_train$X, y = c(Data_train$f+Data_train$noise[,i]), alpha = 1, lambda = lambda[t])
+      estimate_lasso[,i] <- predict(beta_lasso, Data_train$X)
+      test_lasso <- predict(beta_lasso, Data_test$X)
+      testerror_lasso[t] <- testerror_lasso[t] + mean((Data_test$f+Data_test$noise[,i]-test_lasso)^2)
+    }
+    testerror_ridge[t] <- testerror_ridge[t]/nrep
+    testerror_lasso[t] <- testerror_lasso[t]/nrep
+    temp00 <- matrix(rowMeans(estimate_ridge), ncol = 1)
+    temp0 <- Data_train$f %*% matrix(1, nrow = 1, ncol = nrep)
+    temp1 <- temp0 + Data_train$noise
+    temp1 <- temp1 - matrix(rowMeans(temp1), ncol = 1) %*% matrix(1, nrow = 1, ncol = nrep)
+    temp2 <- estimate_ridge - temp00 %*% matrix(1, nrow = 1, ncol = nrep)
+    dof_ridge[t] <- sum(temp1*temp2)/(nrep * Data_train$sigmae)
+    train_ridge[1,t] <- sum((temp0 + Data_train$noise - estimate_ridge)^2)/(nrep * n)
+    train_ridge[2,t] <- sum((rowMeans(estimate_ridge)-Data_train$f)^2)/n
+    train_ridge[3,t] <- sum((temp00 %*% matrix(1, nrow = 1, ncol = nrep) - estimate_ridge)^2)/(nrep * n)
+    train_ridge[4,t] <- train_ridge[2,t] + train_ridge[3,t]
+    
+    
+    temp00 <- matrix(rowMeans(estimate_lasso), ncol = 1)
+    temp3 <- estimate_lasso - temp00 %*% matrix(1, nrow = 1, ncol = nrep)
+    dof_lasso[t] <- sum(temp1*temp3)/(nrep * Data_train$sigmae)
+    train_lasso[1,t] <- sum((temp0 + Data_train$noise- estimate_lasso)^2)/(nrep * n)
+    train_lasso[2,t] <- sum((rowMeans(estimate_lasso)-Data_train$f)^2)/n
+    train_lasso[3,t] <- sum((temp00 %*% matrix(1, nrow = 1, ncol = nrep) - estimate_lasso)^2)/(nrep * n)
+    train_lasso[4,t] <- train_lasso[2,t] + train_lasso[3,t]
+  }
+  result <- list(train_lasso = train_lasso, dof_lasso = dof_lasso, testerror_lasso = testerror_lasso, train_ridge = train_ridge,dof_ridge = dof_ridge, testerror_ridge = testerror_ridge)
+  return(result)
+}
+```
+### Setting1
+$n=100$, $p=10$, $s=5$, $\rho=0$, $SNR= 3.52$, $nrep=100$
+```{r}
+n <- 100
+p <- 10
+s <- 5
+SNR <- 3.52
+rho <- 0
+nrep <- 50
+maxnode <- 20
+mtry_list <- c(0.33, 0.35, 0.4, 0.45, 0.5, 0.6, 0.67, 0.7,0.75, 0.8, 0.85, 0.9, 0.95, 1)
+result1_rdmforest <- Compute_rdmforest(n, p, s, rho = rho, SNR, nrep = nrep, maxnode, mtry_list)
+lambda <- 10^(seq(from = -3, to = 3, by = 0.1))
+result1_ridge_lasso <- Compute_ridge_lasso(n, p, s, rho, SNR, nrep = nrep, lambda = lambda)
+```
+```{r}
+library(ggplot2)
+data1 <- data.frame(mtry = mtry_list, method = rep("RandomForest",each = length(mtry_list)), dof = as.vector(result1_rdmforest$dof_rdforest))
+ggplot(data = data1, aes(x=mtry, y=dof, group = method))+geom_line(aes(linetype=method, color = method))+geom_point(aes(color=method))
+
+data2 <- data.frame(mtry = mtry_list, method = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(mtry_list)), test_error = as.vector(t(result1_rdmforest$test_rdforest)))
+ggplot(data = data2, aes(x=mtry, y=test_error, group = method))+geom_line(aes(linetype=method, color = method))+geom_point(aes(color=method))
+
+data3 <- data.frame(mtry = mtry_list, label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(mtry_list)), train_error = as.vector(t(result1_rdmforest$train_rdforest)))
+ggplot(data = data3, aes(x=mtry, y=train_error, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+```
+The growth of degrees of freedom means model is more and more correlated training data and decreasing of test error shows it is better for prediction. In this contest, $mtry=1$ is best which is a bagging model. Then have a look at the ridge regression model and lasso model:
+
+```{r}
+data4 <- data.frame(log10lambda = rep(log10(lambda),2), method=c(rep("lasso", length(lambda)),rep("ridge", length(lambda))), dof = as.vector(c(result1_ridge_lasso$dof_lasso,result1_ridge_lasso$dof_ridge)))
+
+ggplot(data = data4, aes(x=log10lambda, y=dof, group = method))+geom_line(aes(linetype=method,color=method))+geom_point(aes(color=method))
+
+data5 <- data.frame(log10lambda = rep(log10(lambda),2), method=c(rep("lasso", length(lambda)),rep("ridge", length(lambda))), logtest_error = as.vector(log(c(result1_ridge_lasso$testerror_lasso,result1_ridge_lasso$testerror_ridge))))
+
+ggplot(data = data5, aes(x=log10lambda, y=logtest_error, group = method))+geom_line(aes(linetype=method,color=method))+geom_point(aes(color=method))
+
+data6 <- data.frame(log10lambda = log10(lambda), label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(lambda)), error_lasso = as.vector(t(result1_ridge_lasso$train_lasso)))
+
+ggplot(data = data6, aes(x=log10lambda, y=error_lasso, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+
+data7 <- data.frame(log10lambda = log10(lambda), label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(lambda)), error_ridge = as.vector(t(result1_ridge_lasso$train_ridge)))
+
+ggplot(data = data7, aes(x=log10lambda, y=error_ridge, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+
+```
+It really shows something interesting. Both methods' degrees of freedom decreases but one's test error decreases and another test error grows. Is is because of the $SNR$? Try the following setting:
+
+### Setting2
+$n=100$, $p=10$, $s=5$, $\rho=0$, $SNR= 0.43$, $nrep=100$
+```{r}
+n <- 100
+p <- 10
+s <- 5
+SNR <- 0.43
+rho <- 0
+nrep <- 100
+maxnode <- 20
+mtry_list <- c(0.33, 0.35, 0.4, 0.45, 0.5, 0.6, 0.67, 0.7,0.75, 0.8, 0.85, 0.9, 0.95, 1)
+result1_rdmforest <- Compute_rdmforest(n, p, s, rho = rho, SNR, nrep = nrep, maxnode, mtry_list)
+lambda <- 10^(seq(from = -3, to = 3, by = 0.1))
+result1_ridge_lasso <- Compute_ridge_lasso(n, p, s, rho, SNR, nrep = nrep, lambda = lambda)
+```
+Here, $mtry=1$ is not the best choice to prediction:
+```{r}
+library(ggplot2)
+data1 <- data.frame(mtry = mtry_list, method = rep("RandomForest",each = length(mtry_list)), dof = as.vector(result1_rdmforest$dof_rdforest))
+ggplot(data = data1, aes(x=mtry, y=dof, group = method))+geom_line(aes(linetype=method, color = method))+geom_point(aes(color=method))
+
+data2 <- data.frame(mtry = mtry_list, method = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(mtry_list)), test_error = as.vector(t(result1_rdmforest$test_rdforest)))
+ggplot(data = data2, aes(x=mtry, y=test_error, group = method))+geom_line(aes(linetype=method, color = method))+geom_point(aes(color=method))
+
+data3 <- data.frame(mtry = mtry_list, label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(mtry_list)), train_error = as.vector(t(result1_rdmforest$train_rdforest)))
+ggplot(data = data3, aes(x=mtry, y=train_error, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+```
+```{r}
+data4 <- data.frame(log10lambda = rep(log10(lambda),2), method=c(rep("lasso", length(lambda)),rep("ridge", length(lambda))), dof = as.vector(c(result1_ridge_lasso$dof_lasso,result1_ridge_lasso$dof_ridge)))
+
+ggplot(data = data4, aes(x=log10lambda, y=dof, group = method))+geom_line(aes(linetype=method,color=method))+geom_point(aes(color=method))
+
+data5 <- data.frame(log10lambda = rep(log10(lambda),2), method=c(rep("lasso", length(lambda)),rep("ridge", length(lambda))), logtest_error = as.vector(log(c(result1_ridge_lasso$testerror_lasso,result1_ridge_lasso$testerror_ridge))))
+
+ggplot(data = data5, aes(x=log10lambda, y=logtest_error, group = method))+geom_line(aes(linetype=method,color=method))+geom_point(aes(color=method))
+
+data6 <- data.frame(log10lambda = log10(lambda), label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(lambda)), error_lasso = as.vector(t(result1_ridge_lasso$train_lasso)))
+
+ggplot(data = data6, aes(x=log10lambda, y=error_lasso, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+
+data7 <- data.frame(log10lambda = log10(lambda), label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(lambda)), error_ridge = as.vector(t(result1_ridge_lasso$train_ridge)))
+
+ggplot(data = data7, aes(x=log10lambda, y=error_ridge, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+
+```
+### Setting3
+$n=100$, $p=10$, $s=9$, $\rho=0$, $SNR= 0.43$, $nrep=100$
+```{r}
+n <- 100
+p <- 10
+s <- 9
+SNR <- 0.43
+rho <- 0
+nrep <- 100
+maxnode <- 20
+mtry_list <- c(0.33, 0.35, 0.4, 0.45, 0.5, 0.6, 0.67, 0.7,0.75, 0.8, 0.85, 0.9, 0.95, 1)
+result1_rdmforest <- Compute_rdmforest(n, p, s, rho = rho, SNR, nrep = nrep, maxnode, mtry_list)
+lambda <- 10^(seq(from = -3, to = 2, by = 0.1))
+result1_ridge_lasso <- Compute_ridge_lasso(n, p, s, rho, SNR, nrep = nrep, lambda = lambda)
+```
+Here, $mtry=1$ is not the best choice to prediction:
+```{r}
+library(ggplot2)
+data1 <- data.frame(mtry = mtry_list, method = rep("RandomForest",each = length(mtry_list)), dof = as.vector(result1_rdmforest$dof_rdforest))
+ggplot(data = data1, aes(x=mtry, y=dof, group = method))+geom_line(aes(linetype=method, color = method))+geom_point(aes(color=method))
+
+data2 <- data.frame(mtry = mtry_list, method = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(mtry_list)), test_error = as.vector(t(result1_rdmforest$test_rdforest)))
+ggplot(data = data2, aes(x=mtry, y=test_error, group = method))+geom_line(aes(linetype=method, color = method))+geom_point(aes(color=method))
+
+data3 <- data.frame(mtry = mtry_list, label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(mtry_list)), train_error = as.vector(t(result1_rdmforest$train_rdforest)))
+ggplot(data = data3, aes(x=mtry, y=train_error, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+```
+```{r}
+data4 <- data.frame(log10lambda = rep(log10(lambda),2), method=c(rep("lasso", length(lambda)),rep("ridge", length(lambda))), dof = as.vector(c(result1_ridge_lasso$dof_lasso,result1_ridge_lasso$dof_ridge)))
+
+ggplot(data = data4, aes(x=log10lambda, y=dof, group = method))+geom_line(aes(linetype=method,color=method))+geom_point(aes(color=method))
+
+data5 <- data.frame(log10lambda = rep(log10(lambda),2), method=c(rep("lasso", length(lambda)),rep("ridge", length(lambda))), logtest_error = as.vector(log(c(result1_ridge_lasso$testerror_lasso,result1_ridge_lasso$testerror_ridge))))
+
+ggplot(data = data5, aes(x=log10lambda, y=logtest_error, group = method))+geom_line(aes(linetype=method,color=method))+geom_point(aes(color=method))
+
+data6 <- data.frame(log10lambda = log10(lambda), label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(lambda)), error_lasso = as.vector(t(result1_ridge_lasso$train_lasso)))
+
+ggplot(data = data6, aes(x=log10lambda, y=error_lasso, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+
+data7 <- data.frame(log10lambda = log10(lambda), label = rep(c("MSE", "bias", "variance", "bias+variance"), each = length(lambda)), error_ridge = as.vector(t(result1_ridge_lasso$train_ridge)))
+
+ggplot(data = data7, aes(x=log10lambda, y=error_ridge, group = label))+geom_line(aes(linetype=label, color=label))+geom_point(aes(color=label))
+
+```
